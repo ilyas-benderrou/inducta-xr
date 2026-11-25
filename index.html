@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<title>INDUCTA – Moteur asynchrone</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+<style>
+  #ui{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:10;display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+  #ui button{font:600 15px Arial,sans-serif;padding:10px 14px;border:0;border-radius:10px;background:#1f4e9e;color:#fff}
+</style>
+<script>
+/* Les noms, explications, étapes de démontage et positions des étiquettes
+   viennent directement du GLB (propriétés créées par le script Blender). */
+const V = new THREE.Vector3();
+const G = a => new THREE.Vector3(a[0], a[2], -a[1]);          // repère Blender -> repère glTF
+
+/* ---------- Texte dessiné sur canvas (accents, Δ, φ OK) ---------- */
+function wrap(g, text, maxW){
+  const out=[];
+  text.split('\n').forEach(par=>{
+    let line='';
+    par.split(' ').forEach(w=>{const t=line?line+' '+w:w;
+      if(g.measureText(t).width>maxW && line){out.push(line); line=w;} else line=t;});
+    out.push(line);
+  });
+  return out;
+}
+function labelMesh(text, w, h, o){
+  o=o||{};
+  const c=document.createElement('canvas'); c.width=o.px||512; c.height=Math.round(c.width*h/w);
+  const g=c.getContext('2d');
+  const tex=new THREE.CanvasTexture(c); tex.colorSpace=THREE.SRGBColorSpace;
+  const mesh=new THREE.Mesh(new THREE.PlaneGeometry(w,h), new THREE.MeshBasicMaterial({map:tex,transparent:true}));
+  mesh.userData.draw=function(t){
+    g.clearRect(0,0,c.width,c.height);
+    const r=c.height*0.18;
+    g.beginPath(); if(g.roundRect) g.roundRect(3,3,c.width-6,c.height-6,r); else g.rect(3,3,c.width-6,c.height-6);
+    g.fillStyle=o.bg||'rgba(12,22,40,0.88)'; g.fill();
+    g.lineWidth=4; g.strokeStyle='#4da3ff'; g.stroke();
+    const fs=o.fs||Math.round(c.height*0.5);
+    g.font='600 '+fs+'px Arial, sans-serif';
+    g.fillStyle='#fff'; g.textAlign='center'; g.textBaseline='middle';
+    const L=wrap(g,t,c.width-40), lh=fs*1.2;
+    L.forEach((l,i)=>g.fillText(l,c.width/2,c.height/2+(i-(L.length-1)/2)*lh));
+    tex.needsUpdate=true;
+  };
+  mesh.userData.draw(text);
+  return mesh;
+}
+
+AFRAME.registerComponent('canvas-label',{
+  schema:{text:{default:''},w:{default:0.4},h:{default:0.1},fs:{default:0}},
+  init(){const d=this.data; this.mesh=labelMesh(d.text,d.w,d.h,{fs:d.fs||null,px:1024}); this.el.setObject3D('mesh',this.mesh);},
+  setText(t){this.mesh.userData.draw(t);}
+});
+
+/* ---------- Reflets réalistes pour les métaux ---------- */
+AFRAME.registerComponent('env-light',{
+  init(){
+    const make=()=>{
+      const r=this.el.renderer, s=new THREE.Scene(), g=new THREE.BoxGeometry(1,1,1);
+      const room=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0x7d838c,side:THREE.BackSide}));
+      room.scale.set(10,6,10); s.add(room);
+      [[0,2.9,0,6,0.1,6,5],[4.9,1.2,0,0.1,2,4,3],[-4.9,1.5,0,0.1,2,3,2],[0,1.5,-4.9,4,2,0.1,1.5]].forEach(a=>{
+        const m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:new THREE.Color(a[6],a[6],a[6])}));
+        m.position.set(a[0],a[1],a[2]); m.scale.set(a[3],a[4],a[5]); s.add(m);
+      });
+      this.el.object3D.environment=new THREE.PMREMGenerator(r).fromScene(s,0.04).texture;
+    };
+    if(this.el.renderer) make(); else this.el.addEventListener('renderstart',make);
+  }
+});
+
+/* ---------- Contrôle du moteur ---------- */
+AFRAME.registerComponent('motor-ctrl',{
+  init(){
+    Object.assign(this,{parts:[],S:1,t:0,target:0,run:false,speed:0,labelsOn:true,deco:[],hov:null,hT:0,shown:null});
+    window.MOTOR=this;
+    this.el.addEventListener('model-loaded',()=>this.setup());
+    this.el.addEventListener('model-error',()=>this.say("Erreur : moteur_asynchrone.glb introuvable. Il doit être dans le même dossier que cette page."));
+    this.el.addEventListener('click',e=>{const it=e.detail&&e.detail.intersection; if(it){const p=this.partOf(it.object); if(p) this.show(p);}});
+  },
+  say(t){const p=document.querySelector('#panel'); if(p&&p.components['canvas-label']) p.components['canvas-label'].setText(t);},
+  setup(){
+    const root=this.el.getObject3D('mesh'), me=this.el.object3D;
+    me.updateMatrixWorld(true);
+    root.traverse(o=>{
+      const u=o.userData; if(!u||u.nom===undefined||!u.off) return;
+      o.traverse(m=>{if(m.isMesh) m.material=m.material.clone();});
+      const part={o,u,base:o.position.clone(),off:G(u.off),step:u.step,spin:!!u.spin};
+      this.parts.push(part);
+      this.S=Math.max(this.S,u.step+1);
+      if(u.lp){                                   // étiquette + trait vers la pièce
+        const box=new THREE.Box3().setFromObject(o), c=box.getCenter(new THREE.Vector3());
+        me.worldToLocal(c); c.add(part.off);
+        const lp=G(u.lp), lab=labelMesh(u.nom,0.24,0.05); lab.position.copy(lp); lab.visible=false;
+        const line=new THREE.Line(new THREE.BufferGeometry().setFromPoints([lp.clone().add(new THREE.Vector3(0,-0.025,0)),c]),
+                                  new THREE.LineBasicMaterial({color:0x4da3ff}));
+        line.visible=false; me.add(lab); me.add(line); this.deco.push({lab,line});
+      }
+    });
+    this.cursor=document.querySelector('[cursor]');
+    this.say("INDUCTA – Moteur asynchrone triphasé\n"+this.parts.length+" pièces. Regarde une pièce 1 seconde (ou vise-la avec la manette) pour la découvrir.");
+  },
+  partOf(o){while(o){const u=o.userData; if(u&&u.nom!==undefined&&u.off) return this.parts.find(p=>p.o===o); o=o.parent;} return null;},
+  glow(p,on){p.o.traverse(m=>{if(m.isMesh&&m.material.emissive) m.material.emissive.setHex(on?0x1c3f75:0);});},
+  show(p){if(this.shown) this.glow(this.shown,false); this.shown=p; this.glow(p,true); this.say(p.u.nom.toUpperCase()+'\n'+p.u.info);},
+  toggle(){this.target=this.target?0:1;},
+  tick(time,dtm){
+    const dt=Math.min(dtm||16,50)/1000, n=this.S+1;
+    if(this.t!==this.target){this.t+=(this.target>this.t?1:-1)*dt/(0.7*n); this.t=Math.min(1,Math.max(0,this.t));}
+    for(const p of this.parts){
+      if(p.step<0) continue;
+      const l=Math.min(1,Math.max(0,this.t*n-p.step)), e=l<.5?4*l*l*l:1-Math.pow(-2*l+2,3)/2;
+      p.o.position.set(p.base.x+p.off.x*e,p.base.y+p.off.y*e,p.base.z+p.off.z*e);
+    }
+    this.speed+=((this.run&&this.t===0?10:0)-this.speed)*Math.min(1,dt*0.7);
+    for(const p of this.parts) if(p.spin) p.o.rotation.x+=this.speed*dt;
+    const vis=this.labelsOn&&this.t>0.999, cam=this.el.sceneEl.camera; if(cam) cam.getWorldPosition(V);
+    for(const d of this.deco){d.lab.visible=d.line.visible=vis; if(vis) d.lab.lookAt(V);}
+    const rc=this.cursor&&this.cursor.components.raycaster;          // regard (casque sans manette)
+    if(rc){const it=rc.getIntersection(this.el), p=it?this.partOf(it.object):null;
+      if(p!==this.hov){this.hov=p; this.hT=0;} else if(p&&p!==this.shown){this.hT+=dt; if(this.hT>1) this.show(p);}}
+  }
+});
+
+function act(a){const M=window.MOTOR; if(!M) return;
+  if(a==='exp') M.toggle();
+  if(a==='run'){ if(M.t>0) M.say("Assemble d'abord le moteur avant de le démarrer !"); else M.run=!M.run; }
+  if(a==='lab') M.labelsOn=!M.labelsOn;}
+AFRAME.registerComponent('btn',{schema:{act:{default:''}},init(){const el=this.el;
+  el.addEventListener('mouseenter',()=>el.object3D.scale.setScalar(1.08));
+  el.addEventListener('mouseleave',()=>el.object3D.scale.setScalar(1));
+  el.addEventListener('click',()=>act(this.data.act));}});
+</script>
+</head>
+<body>
+<div id="ui">
+  <button onclick="act('exp')">Démonter / Remonter</button>
+  <button onclick="act('run')">Démarrer / Arrêter</button>
+  <button onclick="act('lab')">Étiquettes</button>
+</div>
+
+<a-scene env-light gltf-model="dracoDecoderPath: https://www.gstatic.com/draco/versioned/decoders/1.5.7/" renderer="colorManagement:true; antialias:true; toneMapping:ACESFilmic; exposure:1.1"
+         loading-screen="dotsColor:#4da3ff; backgroundColor:#20252d">
+  <a-assets timeout="40000"><a-asset-item id="mot" src="moteur_asynchrone.glb"></a-asset-item></a-assets>
+
+  <a-sky color="#20252d"></a-sky>
+  <a-plane rotation="-90 0 0" width="16" height="16" color="#3a3f47"></a-plane>
+  <a-entity light="type:hemisphere; color:#ffffff; groundColor:#555555; intensity:0.8"></a-entity>
+  <a-entity light="type:directional; intensity:1.6" position="2 4 3"></a-entity>
+  <a-entity light="type:directional; intensity:0.6" position="-3 2 -2"></a-entity>
+
+  <!-- établi -->
+  <a-box position="0 0.4 -1.7" width="2.9" depth="0.8" height="0.8" color="#555b63"></a-box>
+
+  <!-- moteur (pattes posées sur l'établi) -->
+  <a-entity id="moteur" class="clickable" gltf-model="#mot" motor-ctrl position="0 0.98 -1.7"></a-entity>
+
+  <!-- panneau d'information -->
+  <a-entity id="panel" canvas-label="w:1.5; h:0.36; fs:48" position="0 2.15 -2.2"></a-entity>
+
+  <!-- boutons 3D (regard ou manette) -->
+  <a-entity class="clickable" btn="act:exp" canvas-label="text:Démonter / Remonter; w:0.42; h:0.1"
+            position="-1.3 1.45 -1.1" rotation="0 45 0"></a-entity>
+  <a-entity class="clickable" btn="act:run" canvas-label="text:Démarrer / Arrêter; w:0.42; h:0.1"
+            position="-1.3 1.30 -1.1" rotation="0 45 0"></a-entity>
+  <a-entity class="clickable" btn="act:lab" canvas-label="text:Étiquettes; w:0.42; h:0.1"
+            position="-1.3 1.15 -1.1" rotation="0 45 0"></a-entity>
+
+  <!-- caméra + curseur au regard (1,5 s) -->
+  <a-entity camera look-controls wasd-controls position="0 1.6 0">
+    <a-entity cursor="fuse:true; fuseTimeout:1500" raycaster="objects:.clickable; far:6" position="0 0 -1"
+              geometry="primitive:ring; radiusInner:0.012; radiusOuter:0.018" material="color:#fff; shader:flat"
+              animation__f="property:scale; startEvents:fusing; from:1 1 1; to:0.3 0.3 0.3; dur:1500"
+              animation__r="property:scale; startEvents:mouseleave; to:1 1 1; dur:150"></a-entity>
+  </a-entity>
+
+  <!-- manettes (casque avec manettes) -->
+  <a-entity laser-controls="hand:right" raycaster="objects:.clickable; far:6"></a-entity>
+  <a-entity laser-controls="hand:left" raycaster="objects:.clickable; far:6"></a-entity>
+</a-scene>
+
+<script>
+  const sceneEl=document.querySelector('a-scene'), ui=document.getElementById('ui');
+  sceneEl.addEventListener('enter-vr',()=>ui.style.display='none');
+  sceneEl.addEventListener('exit-vr',()=>ui.style.display='flex');
+</script>
+</body>
+</html>
